@@ -3,14 +3,15 @@
 
 from __future__ import print_function
 
+import datetime
 import json
 import os
 import sys
-import datetime
+
 from requests import get
 
+from .fetcher import Fetcher, FiatRegistry
 
-_CMC_DATA_API = "https://api.coinmarketcap.com/data-api/v3"
 
 with open(os.path.join(os.path.dirname(__file__), "fiat_ids.json")) as _f:
     _FIAT_IDS = json.load(_f)
@@ -18,6 +19,29 @@ with open(os.path.join(os.path.dirname(__file__), "fiat_ids.json")) as _f:
 _SUPPORTED_FIATS = ", ".join(sorted(_FIAT_IDS))
 
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+_FIAT_REGISTRY = FiatRegistry(mapping=_FIAT_IDS)
+_default_fetcher = None
+
+
+def _get_default_fetcher():
+    """Lazily build the process-wide Fetcher used by the legacy helpers.
+
+    The transport is late-bound to this module's ``get_url_data`` so code
+    (and tests) that patch ``cryptocmd.utils.get_url_data`` keep intercepting
+    every request made by the legacy entry points.
+    """
+    global _default_fetcher
+    if _default_fetcher is None:
+        _default_fetcher = Fetcher(
+            headers=_HEADERS, fiat_registry=_FIAT_REGISTRY
+        )
+    return _default_fetcher
+
+
+def _legacy_transport(url):
+    # Indirection so a runtime patch of ``get_url_data`` always takes effect.
+    return get_url_data(url)
 
 
 def get_url_data(url):
@@ -43,33 +67,10 @@ def get_coin_id(coin_code, coin_name):
     :return: numeric coin id for the cryptocurrency on coinmarketcap.com
     """
 
-    api_url = (
-        "{}/cryptocurrency/listing?start=1&limit=5000"
-        "&sortBy=market_cap&sortType=desc&convert=USD"
-        "&cryptoType=all&tagType=all&audited=false"
-    ).format(_CMC_DATA_API)
-
     try:
-        json_data = get_url_data(api_url).json()
-        error_code = json_data["status"]["error_code"]
-        if str(error_code) == "0":
-            coins = json_data["data"]["cryptoCurrencyList"]
-            matches = [
-                c
-                for c in coins
-                if c["symbol"].upper() == coin_code.upper()
-                and (coin_name is None or c["name"].lower() == coin_name.lower())
-            ]
-            if matches:
-                return matches[0]["id"]
-            raise InvalidCoinCode(
-                "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
-            )
-        if str(error_code) == "400":
-            raise InvalidCoinCode(
-                "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
-            )
-        raise Exception(json_data["status"]["error_message"])
+        return _get_default_fetcher().get_coin_id(
+            coin_code, coin_name, transport=_legacy_transport
+        )
     except Exception as e:
         print("Error fetching coin id data for coin code {}".format(coin_code))
         print("Error message:", e)
@@ -114,37 +115,22 @@ def download_coin_data(
     )
 
     try:
-        # CMC caps responses at ~365 entries per request; split into yearly chunks
-        # so long/all-time ranges always return daily granularity.
-        # timeStart is exclusive (first returned day = timeStart + 1), so each
-        # chunk's timeStart equals the previous chunk's timeEnd — no overlap, no gap.
-        all_quotes = []
-        result_json = None
-        chunk_start = start_dt - datetime.timedelta(days=1)
-
-        while chunk_start < end_dt:
-            chunk_end = min(chunk_start + datetime.timedelta(days=365), end_dt)
-            api_url = (
-                "{}/cryptocurrency/historical"
-                "?id={}&convertId={}&timeStart={}&timeEnd={}"
-            ).format(
-                _CMC_DATA_API,
-                coin_id,
-                convert_id,
-                int(chunk_start.timestamp()),
-                int(chunk_end.timestamp()),
-            )
-            json_data = get_url_data(api_url).json()
-            status = json_data.get("status", {})
-            error_code = status.get("error_code")
-            if error_code and str(error_code) != "0":
-                raise Exception(status.get("error_message", "Unknown error"))
-            if result_json is None:
-                result_json = json_data
-            all_quotes.extend(json_data["data"]["quotes"])
-            chunk_start = chunk_end + datetime.timedelta(days=1)
-
-        result_json["data"]["quotes"] = all_quotes
+        pages, result_json = _get_default_fetcher().fetch_pages(
+            coin_id=coin_id,
+            convert_id=convert_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            coin_code=coin_code,
+            coin_name=coin_name,
+            id_number=id_number,
+            fiat=fiat,
+            transport=_legacy_transport,
+        )
+        result_json["data"]["quotes"] = [
+            quote
+            for page in pages
+            for quote in page["data"]["quotes"]
+        ]
 
         if id_number:
             show_coin_info = False
