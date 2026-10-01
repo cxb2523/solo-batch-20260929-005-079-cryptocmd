@@ -6,7 +6,6 @@ from __future__ import print_function
 import json
 import os
 import sys
-import datetime
 from requests import get
 
 
@@ -43,37 +42,9 @@ def get_coin_id(coin_code, coin_name):
     :return: numeric coin id for the cryptocurrency on coinmarketcap.com
     """
 
-    api_url = (
-        "{}/cryptocurrency/listing?start=1&limit=5000"
-        "&sortBy=market_cap&sortType=desc&convert=USD"
-        "&cryptoType=all&tagType=all&audited=false"
-    ).format(_CMC_DATA_API)
+    from .fetcher import Fetcher
 
-    try:
-        json_data = get_url_data(api_url).json()
-        error_code = json_data["status"]["error_code"]
-        if str(error_code) == "0":
-            coins = json_data["data"]["cryptoCurrencyList"]
-            matches = [
-                c
-                for c in coins
-                if c["symbol"].upper() == coin_code.upper()
-                and (coin_name is None or c["name"].lower() == coin_name.lower())
-            ]
-            if matches:
-                return matches[0]["id"]
-            raise InvalidCoinCode(
-                "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
-            )
-        if str(error_code) == "400":
-            raise InvalidCoinCode(
-                "'{}' coin code is unavailable on coinmarketcap.com".format(coin_code)
-            )
-        raise Exception(json_data["status"]["error_message"])
-    except Exception as e:
-        print("Error fetching coin id data for coin code {}".format(coin_code))
-        print("Error message:", e)
-        raise e
+    return Fetcher().get_coin_id(coin_code, coin_name)
 
 
 def download_coin_data(
@@ -94,88 +65,11 @@ def download_coin_data(
     :return: json data with historical OHLCV data for the cryptocurrency
     """
 
-    if start_date is None:
-        # default start date on coinmarketcap.com
-        start_date = "28-4-2013"
+    from .fetcher import Fetcher
 
-    if end_date is None:
-        end_date = datetime.date.today().strftime("%d-%m-%Y")
-
-    coin_id = id_number if id_number else get_coin_id(coin_code, coin_name)
-    convert_id = _FIAT_IDS.get(fiat.upper())
-    if convert_id is None:
-        raise ValueError(f"Unknown fiat '{fiat}'. Supported: {_SUPPORTED_FIATS}.")
-
-    start_dt = datetime.datetime.strptime(start_date, "%d-%m-%Y").replace(
-        tzinfo=datetime.timezone.utc
+    return Fetcher().fetch_coin_data(
+        coin_code, start_date, end_date, fiat, coin_name, id_number
     )
-    end_dt = datetime.datetime.strptime(end_date, "%d-%m-%Y").replace(
-        tzinfo=datetime.timezone.utc
-    )
-
-    try:
-        # CMC caps responses at ~365 entries per request; split into yearly chunks
-        # so long/all-time ranges always return daily granularity.
-        # timeStart is exclusive (first returned day = timeStart + 1), so each
-        # chunk's timeStart equals the previous chunk's timeEnd — no overlap, no gap.
-        all_quotes = []
-        result_json = None
-        chunk_start = start_dt - datetime.timedelta(days=1)
-
-        while chunk_start < end_dt:
-            chunk_end = min(chunk_start + datetime.timedelta(days=365), end_dt)
-            api_url = (
-                "{}/cryptocurrency/historical"
-                "?id={}&convertId={}&timeStart={}&timeEnd={}"
-            ).format(
-                _CMC_DATA_API,
-                coin_id,
-                convert_id,
-                int(chunk_start.timestamp()),
-                int(chunk_end.timestamp()),
-            )
-            json_data = get_url_data(api_url).json()
-            status = json_data.get("status", {})
-            error_code = status.get("error_code")
-            if error_code and str(error_code) != "0":
-                raise Exception(status.get("error_message", "Unknown error"))
-            if result_json is None:
-                result_json = json_data
-            all_quotes.extend(json_data["data"]["quotes"])
-            chunk_start = chunk_end + datetime.timedelta(days=1)
-
-        result_json["data"]["quotes"] = all_quotes
-
-        if id_number:
-            show_coin_info = False
-            if coin_code and coin_code.upper() != result_json["data"]["symbol"].upper():
-                print(
-                    f"INFO: Using 'id_number'! The 'coin_code' ({coin_code}) provided "
-                    + "is different from the symbol returned."
-                )
-                show_coin_info = True
-            if coin_name and coin_name.lower() != result_json["data"]["name"].lower():
-                print(
-                    f"INFO: Using 'id_number'! The 'coin_name' ({coin_name}) provided "
-                    + "is different from the name returned."
-                )
-                show_coin_info = True
-            if show_coin_info:
-                print(
-                    f"""The returned data belongs to coin "{result_json['data']['name']}", """
-                    + f"""with symbol "{result_json['data']['symbol']}" """
-                )
-        return result_json
-    except Exception as e:
-        print(
-            "Error fetching price data for {} for interval '{}' and '{}'".format(
-                f"(id {id_number})" if id_number else coin_code,
-                start_date,
-                end_date,
-            )
-        )
-        print("Error message (download_data) :", e)
-        raise e
 
 
 def _replace(s, bad_chars):

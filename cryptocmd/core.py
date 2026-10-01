@@ -11,11 +11,12 @@ from __future__ import print_function
 __all__ = ["CmcScraper"]
 
 import os
-import csv
-import tablib
 import warnings
 from datetime import datetime
-from .utils import download_coin_data, InvalidParameters
+from .utils import InvalidParameters
+from .fetcher import Fetcher
+from .parser import Parser
+from .exporter import Exporter
 
 
 class CmcScraper(object):
@@ -34,6 +35,9 @@ class CmcScraper(object):
         fiat="USD",
         coin_name=None,
         id_number=None,
+        fetcher=None,
+        parser=None,
+        exporter=None,
     ):
         """
         :param coin_code: coin code of cryptocurrency e.g. btc. Will be ignored if using id_number.
@@ -47,6 +51,9 @@ class CmcScraper(object):
         :param coin_name: coin name in case of many coins with same code e.g. sol -> solana, solcoin
         :param id_number: id number for the a cryptocurrency on the coinmarketcap.com.
             Will override coin_code and coin_name when provided.
+        :param fetcher: (optional) Fetcher instance handling download/cache/retry.
+        :param parser: (optional) Parser instance converting CMC payloads to rows.
+        :param exporter: (optional) Exporter instance for csv/dataframe/html output.
         """
 
         self.coin_code = coin_code
@@ -56,19 +63,10 @@ class CmcScraper(object):
         self.order_ascending = order_ascending
         self.fiat = fiat
         self.coin_name = coin_name
-        self.headers = [
-            "Date",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "Market Cap",
-            "Time Open",
-            "Time High",
-            "Time Low",
-            "Time Close",
-        ]
+        self._fetcher = fetcher if fetcher is not None else Fetcher()
+        self._parser = parser if parser is not None else Parser()
+        self._exporter = exporter if exporter is not None else Exporter()
+        self.headers = list(self._parser.headers)
         self.rows = []
         self.id_number = id_number
 
@@ -103,7 +101,7 @@ class CmcScraper(object):
         if self.all_time:
             self.start_date, self.end_date = None, None
 
-        coin_data = download_coin_data(
+        coin_data = self._fetcher.fetch_coin_data(
             self.coin_code,
             self.start_date,
             self.end_date,
@@ -112,27 +110,7 @@ class CmcScraper(object):
             self.id_number,
         )
 
-        for _row in coin_data["data"]["quotes"]:
-            _row_quote = _row["quote"]
-            date = datetime.strptime(
-                _row["timeOpen"], "%Y-%m-%dT%H:%M:%S.%fZ"
-            ).strftime("%d-%m-%Y")
-
-            row = [
-                date,
-                _row_quote["open"],
-                _row_quote["high"],
-                _row_quote["low"],
-                _row_quote["close"],
-                _row_quote["volume"],
-                _row_quote["marketCap"],
-                _row["timeOpen"],
-                _row["timeHigh"],
-                _row["timeLow"],
-                _row["timeClose"],
-            ]
-
-            self.rows.insert(0, row)
+        self.rows = self._parser.parse(coin_data) + self.rows
 
         if self.rows:
             self.end_date, self.start_date = self.rows[0][0], self.rows[-1][0]
@@ -156,11 +134,7 @@ class CmcScraper(object):
             for row in self.rows:
                 print(*row, sep=", ")
         elif format:
-            data = tablib.Dataset()
-            data.headers = self.headers
-            for row in self.rows:
-                data.append(row)
-            return data.export(format)
+            return self._exporter.to_format(format, self.headers, self.rows)
         else:
             return self.headers, self.rows
 
@@ -172,31 +146,14 @@ class CmcScraper(object):
         :return: DataFrame of the downloaded data.
         """
 
-        try:
-            import pandas as pd
-        except ImportError:
-            pd = None
-
-        if pd is None:
-            raise NotImplementedError(
-                "DataFrame Format requires 'pandas' to be installed."
-                "Try : pip install pandas"
-            )
+        # fail fast, before any download, when pandas is not installed
+        self._exporter.require_pandas()
 
         self._download_data(**kwargs)
 
-        dataframe = pd.DataFrame(data=self.rows, columns=self.headers)
-
-        # convert 'Date' column to datetime type
-        dataframe["Date"] = pd.to_datetime(
-            dataframe["Date"], format="%d-%m-%Y", dayfirst=True
+        return self._exporter.to_dataframe(
+            self.headers, self.rows, date_as_index=date_as_index
         )
-
-        if date_as_index:
-            # set 'Date' column as index and drop the the 'Date' column.
-            dataframe.set_index("Date", inplace=True)
-
-        return dataframe
 
     def export_csv(self, csv_name=None, csv_path=None, **kwargs):
         """
@@ -230,13 +187,44 @@ class CmcScraper(object):
         _csv = "{0}/{1}".format(csv_path, csv_name)
 
         try:
-            with open(_csv, "w", newline="", encoding="utf-8") as csvfile:
-                writer = csv.writer(
-                    csvfile, delimiter=",", quoting=csv.QUOTE_NONNUMERIC
-                )
-                writer.writerow(self.headers)
-                for data in self.rows:
-                    writer.writerow(data)
+            self._exporter.to_csv_file(self.headers, self.rows, _csv)
+        except IOError as err:
+            errno, strerror = err.args
+            print("I/O error({0}): {1}".format(errno, strerror))
+
+    def export_html(self, name=None, path=None, **kwargs):
+        """
+        This exports scraped data into a standalone HTML page (inline styles,
+        no external dependencies) that can be opened directly in a browser.
+        :param name: (optional) name of the html file.
+        :param path: (optional) path to where export the html file.
+        :param kwargs: Optional arguments that data downloader takes.
+        :return:
+        """
+
+        self._download_data(**kwargs)
+
+        if path is None:
+            # Export in current directory if path not specified
+            path = os.getcwd()
+
+        if name is None:
+            # Make name fo file in format of {coin_code}_{fiat}_{start_date}_{end_date}.html
+            name = "{0}_{1}_{2}_{3}.html".format(
+                self.coin_code, self.fiat, self.start_date, self.end_date
+            )
+
+        if not name.endswith(".html"):
+            name += ".html"
+
+        _html = "{0}/{1}".format(path, name)
+
+        title = "{0} {1} {2} - {3}".format(
+            self.coin_code, self.fiat, self.start_date, self.end_date
+        )
+
+        try:
+            self._exporter.to_html_file(self.headers, self.rows, _html, title=title)
         except IOError as err:
             errno, strerror = err.args
             print("I/O error({0}): {1}".format(errno, strerror))

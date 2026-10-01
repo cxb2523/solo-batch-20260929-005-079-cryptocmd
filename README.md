@@ -91,6 +91,36 @@ df = scraper.get_dataframe()
 
 `Date, Open, High, Low, Close, Volume, Market Cap, Time Open, Time High, Time Low, Time Close`
 
+#### To export a standalone HTML page
+
+```python
+from cryptocmd import CmcScraper
+
+scraper = CmcScraper("XRP", "15-10-2017", "25-10-2017")
+
+# export a single-page market table that opens directly in a browser
+scraper.export_html(name="xrp")
+```
+
+#### Fetcher / Parser / Exporter layers
+
+The scraping pipeline is split into three injectable layers, exposed as
+`cryptocmd.Fetcher`, `cryptocmd.Parser` and `cryptocmd.Exporter`:
+
+```python
+from cryptocmd import CmcScraper, Fetcher
+
+# cache downloads on disk and retry failed requests
+fetcher = Fetcher(cache_dir=".cryptocmd_cache", max_retries=3)
+
+scraper = CmcScraper("btc", fetcher=fetcher)
+headers, data = scraper.get_data()
+```
+
+The cache key covers the coin, fiat and date range; failed downloads are
+never cached and cache files are replaced atomically. `pandas` is only
+required for `get_dataframe()`; CSV export works without it.
+
 ## Acknowledgements
 
 The data is being scrapped from
